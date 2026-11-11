@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <shlobj.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <atomic>
@@ -148,7 +149,7 @@ static std::wstring ItemName(const Item& it) {
 
 static std::wstring CreateFreshRoot() {
     for (unsigned long long i = 1;; ++i) {
-        std::wstring root = L"C:\\SS" + std::to_wstring(i);
+        std::wstring root = L"C:\\ss" + std::to_wstring(i);
         if (CreateDirectoryW(root.c_str(), nullptr)) return root;
         if (GetLastError() != ERROR_ALREADY_EXISTS && i > 1000) {
             fwprintf(stderr, L"Cannot create %s (error %lu)\n", root.c_str(),
@@ -275,14 +276,23 @@ static std::vector<std::wstring> ListDir(const std::wstring& dir) {
 }
 
 static void RemoveTree(const std::wstring& p) {
-    for (auto& n : ListDir(p)) {
-        std::wstring c = p + L"\\" + n;
-        if (IsDir(c)) RemoveTree(c);
-        else {
-            SetFileAttributesW(c.c_str(), FILE_ATTRIBUTE_NORMAL);
-            DeleteFileW(c.c_str());
+    DWORD pa = GetFileAttributesW(p.c_str());
+    bool link = pa != INVALID_FILE_ATTRIBUTES &&
+                (pa & FILE_ATTRIBUTE_REPARSE_POINT);
+    if (!link) {  
+        for (auto& n : ListDir(p)) {
+            std::wstring c = p + L"\\" + n;
+            DWORD a = GetFileAttributesW(c.c_str());
+            bool isDir = a != INVALID_FILE_ATTRIBUTES &&
+                         (a & FILE_ATTRIBUTE_DIRECTORY);
+            if (isDir) RemoveTree(c);
+            else {
+                SetFileAttributesW(c.c_str(), FILE_ATTRIBUTE_NORMAL);
+                DeleteFileW(c.c_str());
+            }
         }
     }
+    SetFileAttributesW(p.c_str(), FILE_ATTRIBUTE_NORMAL);
     RemoveDirectoryW(p.c_str());
 }
 
@@ -386,6 +396,96 @@ static void Worker(const std::vector<Item>& items) {
     }
 }
 
+static bool PathUnder(const std::wstring& path, const std::wstring& root) {
+    return path.size() > root.size() &&
+           _wcsnicmp(path.c_str(), root.c_str(), root.size()) == 0 &&
+           path[root.size()] == L'\\';
+}
+
+static int KillProcessesIn(const std::wstring& root) {
+    int killed = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    DWORD self = GetCurrentProcessId();
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (pe.th32ProcessID == 0 || pe.th32ProcessID == self) continue;
+            HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION |
+                                       PROCESS_TERMINATE | SYNCHRONIZE,
+                                   FALSE, pe.th32ProcessID);
+            if (!h) continue;
+            std::vector<wchar_t> buf(32768);
+            DWORD n = (DWORD)buf.size();
+            if (QueryFullProcessImageNameW(h, 0, buf.data(), &n) &&
+                PathUnder(std::wstring(buf.data(), n), root)) {
+                if (TerminateProcess(h, 1)) {
+                    WaitForSingleObject(h, 3000);
+                    killed++;
+                    wprintf(L"  killed %s (PID %lu)\n", pe.szExeFile,
+                            pe.th32ProcessID);
+                } else {
+                    wprintf(L"  could not kill %s (PID %lu, error %lu)\n",
+                            pe.szExeFile, pe.th32ProcessID, GetLastError());
+                }
+            }
+            CloseHandle(h);
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return killed;
+}
+
+static int Cleanup(unsigned long long only) {
+    std::vector<std::wstring> roots;
+    if (only) {
+        std::wstring r = L"C:\\ss" + std::to_wstring(only);
+        if (IsDir(r)) roots.push_back(r);
+    } else {
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW(L"C:\\ss*", &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                std::wstring n = fd.cFileName;
+                bool digits = n.size() > 2;
+                for (size_t i = 2; i < n.size(); ++i)
+                    if (!iswdigit(n[i])) digits = false;
+                if (digits && (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                    roots.push_back(L"C:\\" + n);
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+    }
+    if (roots.empty()) {
+        wprintf(L"No ss folders found.\n");
+        return 0;
+    }
+
+    int failed = 0;
+    for (auto& root : roots) {
+        wprintf(L"Cleaning %s\n", root.c_str());
+        for (int pass = 0; pass < 3; ++pass)
+            if (KillProcessesIn(root) == 0) break;
+
+        for (int attempt = 0; attempt < 6 && IsDir(root); ++attempt) {
+            RemoveTree(root);
+            if (IsDir(root)) {
+                Sleep(500);
+                KillProcessesIn(root);
+            }
+        }
+        if (IsDir(root)) {
+            wprintf(L"  FAILED to fully delete %s (files in use? try as admin)\n",
+                    root.c_str());
+            failed++;
+        } else {
+            wprintf(L"  deleted %s\n", root.c_str());
+        }
+    }
+    return failed ? 2 : 0;
+}
+
 int wmain(int argc, wchar_t** argv) {
     std::wstring listUrl = DEFAULT_LIST;
     unsigned threads = 16;
@@ -393,8 +493,15 @@ int wmain(int argc, wchar_t** argv) {
         std::wstring a = argv[i];
         if (a == L"-j" && i + 1 < argc) threads = std::max(1, _wtoi(argv[++i]));
         else if (a == L"-u" && i + 1 < argc) listUrl = argv[++i];
+        else if (a == L"-cleanup") {
+            unsigned long long n = 0;
+            if (i + 1 < argc && iswdigit(argv[i + 1][0]))
+                n = _wcstoui64(argv[++i], nullptr, 10);
+            return Cleanup(n);
+        }
         else {
-            wprintf(L"Usage: fastdl [-j threads] [-u list_url]\n");
+            wprintf(L"Usage: fastdl [-j threads] [-u list_url]\n"
+                    L"       fastdl -cleanup [N]\n");
             return 1;
         }
     }
